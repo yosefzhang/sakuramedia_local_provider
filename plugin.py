@@ -78,6 +78,7 @@ class LocalMediaProviderBundle:
     display_name = DISPLAY_NAME
     library_config_fields = LIBRARY_CONFIG_FIELDS
     playback_deliveries = ("proxy",)
+    merged_playback_format = "mp4"
 
     def __init__(self, *, data_dir: Path) -> None:
         self.data_dir = data_dir
