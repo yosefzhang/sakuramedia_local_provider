@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -87,6 +88,38 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
         "kind": "manual_local_path",
         "relative_path": "nested/clip.mp4",
     }
+
+
+def test_import_source_identity_tracks_source_content_and_location(
+    tmp_path: Path,
+) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    source_path = import_root / "clip.mp4"
+    source_path.write_bytes(b"source")
+    root_ref = {"version": 1, "kind": "manual_local_path", "relative_path": ""}
+
+    source = provider.scan_import_source(source_ref=root_ref)[0]
+    identity = provider.get_import_source_identity(source=source)
+    assert (
+        provider.get_import_source_identity(
+            source=provider.scan_import_source(source_ref=root_ref)[0]
+        )
+        == identity
+    )
+
+    source_path.write_bytes(b"changed source")
+    changed_identity = provider.get_import_source_identity(
+        source=provider.scan_import_source(source_ref=root_ref)[0]
+    )
+    assert changed_identity != identity
+
+    source_path.rename(import_root / "renamed.mp4")
+    assert (
+        provider.get_import_source_identity(
+            source=provider.scan_import_source(source_ref=root_ref)[0]
+        )
+        != changed_identity
+    )
 
 
 def test_stage_is_idempotent_and_layout_has_operation_version(
@@ -296,6 +329,7 @@ def test_merged_playback_uses_ordered_local_media_and_range_response(
 
     def build_fake_layout(entries):
         seen["entries"] = entries
+        seen["thread_id"] = threading.get_ident()
         return Layout()
 
     monkeypatch.setattr(storage_module, "build_layout", build_fake_layout)
@@ -326,6 +360,7 @@ def test_merged_playback_uses_ordered_local_media_and_range_response(
     assert response.headers["content-range"] == "bytes 2-5/10"
     assert asyncio.run(_response_body(response)) == b"2345"
     assert seen["entries"] == [(1, first_path), (2, second_path)]
+    assert seen["thread_id"] != threading.get_ident()
 
 
 def test_compute_file_hash_matches_protocol_vector(tmp_path: Path) -> None:
@@ -391,7 +426,9 @@ def test_open_cover_source_returns_a_seekable_media_file(tmp_path: Path) -> None
         assert source.read() == b"media"
 
 
-def test_thumbnails_decode_once_and_write_webp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_thumbnails_seek_each_offset_and_write_webp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     provider, library, media_root, _import_root = _provider(tmp_path)
     path = media_root / "videos/clip.mp4"
     path.parent.mkdir(parents=True)
@@ -411,24 +448,39 @@ def test_thumbnails_decode_once_and_write_webp(tmp_path: Path, monkeypatch: pyte
         stream = SimpleNamespace(type="video", time_base=1)
         streams = SimpleNamespace(video=(stream,))
 
+        def __init__(self):
+            self.seek_calls = []
+            self.decode_calls = 0
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return None
 
+        def seek(self, timestamp, *, stream, backward, any_frame):
+            assert stream is self.stream
+            assert backward is True
+            assert any_frame is False
+            self.seek_calls.append(timestamp)
+
         def decode(self, stream):
             assert stream is self.stream
-            return iter((FakeFrame(0), FakeFrame(10)))
+            self.decode_calls += 1
+            return iter((FakeFrame(0),))
 
-    fake_av = SimpleNamespace(open=lambda _path: FakeContainer())
+    container = FakeContainer()
+    fake_av = SimpleNamespace(open=lambda _path: container)
     monkeypatch.setitem(sys.modules, "av", fake_av)
+    monkeypatch.setattr(storage_module.os, "nice", lambda _value: 0)
     workspace = tmp_path / "thumbs"
     generation = provider.generate_thumbnails(
-        media=_media(library, "videos/clip.mp4", duration=10), workspace=workspace
+        media=_media(library, "videos/clip.mp4", duration=20), workspace=workspace
     )
-    assert generation.expected_count == 2
-    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10]
+    assert generation.expected_count == 3
+    assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
+    assert container.seek_calls == [10, 20]
+    assert container.decode_calls == 3
     assert all((workspace / artifact.relative_path).read_bytes().startswith(b"RIFF") for artifact in generation.artifacts)
 
 
