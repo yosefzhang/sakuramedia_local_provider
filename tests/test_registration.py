@@ -46,6 +46,8 @@ def test_library_configuration_is_normalised_without_creating_directories(tmp_pa
     assert prepared.provider_config == {
         "media_root_path": str(media_root),
         "manual_import_root_path": str(manual_import_root),
+        # fork: filename_blacklist 留空时规范化默认输出 trailer（官方版无此键）
+        "filename_blacklist": "trailer",
     }
     assert not media_root.exists()
     assert not manual_import_root.exists()
