@@ -51,7 +51,7 @@ LIBRARY_CONFIG_FIELDS = (
         label="文件名黑名单",
         input="text",
         required=False,
-        description="每行一个关键字；文件名包含关键字时不会导入，匹配不区分大小写。",
+        description="每行一个关键字；文件名包含关键字时不会导入，匹配不区分大小写。留空默认过滤 trailer。",
         multiline=True,
         hint="sample\ntrailer",
     ),
@@ -70,10 +70,11 @@ def _normalise_path(value: object) -> str:
 
 def _normalise_filename_blacklist(value: object) -> str:
     if value is None:
-        return ""
+        return "trailer"
     if not isinstance(value, str):
         raise ValueError("invalid filename blacklist")
-    return "\n".join(line.strip() for line in value.splitlines() if line.strip())
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return "\n".join(lines) if lines else "trailer"
 
 
 class LocalMediaProviderBundle:

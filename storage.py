@@ -273,8 +273,8 @@ def _is_video(name: str) -> bool:
 
 
 def _filename_blacklist(value: object) -> tuple[str, ...]:
-    if not isinstance(value, str):
-        return ()
+    if not isinstance(value, str) or not value.strip():
+        return ("trailer",)
     return tuple(
         entry.casefold()
         for line in value.splitlines()
