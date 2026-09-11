@@ -63,14 +63,16 @@ class FakeQBClient:
             raise self.add_result
         source_uri = kwargs.get("urls")
         info_hash = qbittorrent.parse_hash_from_magnet(source_uri) if isinstance(source_uri, str) else HASH
+        # 插件不再传目录名：qB 依种子自身命名（此处模拟单文件种子的内部名）
+        torrent_name = "abc-001.mp4"
         self.items = [
             SimpleNamespace(
                 hash=info_hash,
-                name=kwargs["rename"],
+                name=torrent_name,
                 state="queuedDL",
                 progress=0.0,
                 tags=kwargs["tags"],
-                content_path=kwargs["save_path"],
+                content_path=f"{kwargs['save_path']}/{torrent_name}",
             )
         ]
         return self.add_result
@@ -251,7 +253,7 @@ def test_magnet_hash_accepts_hex_and_base32() -> None:
     assert qbittorrent.parse_hash_from_magnet(f"magnet:?xt=urn:btih:{base32_hash}") == raw_hash.hex()
 
 
-def test_submit_magnet_uses_managed_tags_and_safe_remote_path(provider) -> None:
+def test_submit_magnet_uses_tags_and_plain_remote_root(provider) -> None:
     client, fake = provider
     task = client.submit(
         submission=DownloadSubmission(
@@ -261,12 +263,12 @@ def test_submit_magnet_uses_managed_tags_and_safe_remote_path(provider) -> None:
     )
     assert task.remote_id == HASH
     assert task.state == "queued"
+    # 目录名由 qBittorrent 依种子自身命名：插件只给下载根目录，不传 rename
     assert fake.add_calls == [
         {
             "urls": f"magnet:?xt=urn:btih:{HASH}",
             "tags": "sakuramedia,client:7",
-            "save_path": "/downloads/ABC 001",
-            "rename": "ABC 001",
+            "save_path": "/downloads",
         }
     ]
     assert fake.logged_in == 1
@@ -277,18 +279,18 @@ def test_submit_magnet_uses_managed_tags_and_safe_remote_path(provider) -> None:
     }
 
 
-def test_submit_magnet_sanitizes_path_unsafe_display_name(provider) -> None:
+def test_submit_magnet_does_not_put_display_name_into_path(provider) -> None:
     client, fake = provider
 
     client.submit(
         submission=DownloadSubmission(
             source_uri=f"magnet:?xt=urn:btih:{HASH}",
-            display_name="ABC/foo\\remux",
+            display_name="ABC/foo\\remux" + "あ" * 120,
         )
     )
 
-    assert fake.add_calls[0]["save_path"] == "/downloads/ABC foo remux"
-    assert fake.add_calls[0]["rename"] == "ABC foo remux"
+    assert fake.add_calls[0]["save_path"] == "/downloads"
+    assert "rename" not in fake.add_calls[0]
 
 
 def test_submit_torrent_downloads_url_and_submits_bytes(monkeypatch: pytest.MonkeyPatch, provider) -> None:

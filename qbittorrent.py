@@ -886,7 +886,8 @@ class QbittorrentDownloadProvider:
         if not isinstance(submission, DownloadSubmission):
             raise _error("submit", "invalid_config", "下载提交参数无效")
         try:
-            display_name = _safe_display_name(submission.display_name)
+            # display_name 只做提交参数校验：目录名改由 qBittorrent 依种子自身命名
+            _safe_display_name(submission.display_name)
             source_uri = submission.source_uri.strip()
             if not source_uri:
                 raise ValueError("empty source")
@@ -902,7 +903,9 @@ class QbittorrentDownloadProvider:
             )
             raise _error("submit", "source_blacklisted", "该种子已被列入下载黑名单")
         tags = f"{SYSTEM_TAG},{CLIENT_TAG_PREFIX}{self.client_handle.client_id}"
-        save_path = _remote_save_path(self.remote_save_root, display_name)
+        # 目录名交给 qBittorrent 依种子自身命名（M-Team 的种子多按番号命名，天然简短），
+        # 插件只给出下载根目录，避免把搜索标题拼进路径导致超长目录名。
+        save_path = self.remote_save_root
         self._login()
         added = False
         try:
@@ -911,14 +914,12 @@ class QbittorrentDownloadProvider:
                     urls=source_payload,
                     tags=tags,
                     save_path=save_path,
-                    rename=display_name,
                 )
             else:
                 response = self.client.torrents_add(
                     torrent_files=source_payload,
                     tags=tags,
                     save_path=save_path,
-                    rename=display_name,
                 )
             if not self._add_succeeded(response):
                 raise RuntimeError("qBittorrent rejected torrent")
