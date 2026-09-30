@@ -14,6 +14,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,7 +38,9 @@ from src.plugins.provider_protocol import (
     MediaTransferSourceInfo,
     PlaybackContext,
     ProviderOperationError,
+    ScanProgressCallback,
     StagedMedia,
+    StorageSpaceUsage,
     ThumbnailArtifact,
     ThumbnailGeneration,
 )
@@ -367,6 +371,20 @@ class LocalStorageProvider:
             "relative_path": relative_path,
         }
 
+    def get_space_usage(self) -> StorageSpaceUsage:
+        try:
+            _reject_symlink_components(self.media_root)
+            usage = shutil.disk_usage(self.media_root)
+        except (OSError, ValueError) as exc:
+            raise _provider_error(
+                "get_space_usage", "unavailable", "本地存储空间读取失败", retryable=True
+            ) from exc
+        return StorageSpaceUsage(
+            total_bytes=usage.total,
+            used_bytes=usage.used,
+            free_bytes=usage.free,
+        )
+
     def scan_managed_media_ref_keys(self) -> set[str]:
         """Enumerate regular files below the configured media root for validity checks."""
         try:
@@ -538,7 +556,10 @@ class LocalStorageProvider:
         next_cursor = str(offset + limit) if offset + limit < len(children) else None
         return BrowsePage(entries=tuple(item[2] for item in page), next_cursor=next_cursor)
 
-    def scan_import_source(self, *, source_ref: JsonObject) -> tuple[ImportFile, ...]:
+    def scan_import_source(
+        self, *, source_ref: JsonObject,
+        progress_callback: ScanProgressCallback | None = None,
+    ) -> tuple[ImportFile, ...]:
         source_root, source_kind = self._source_root_for_ref(
             source_ref,
             operation="scan_import_source",
@@ -551,14 +572,38 @@ class LocalStorageProvider:
         )
         if not source_path.exists() or not (source_path.is_file() or source_path.is_dir()):
             raise _provider_error("scan_import_source", "source_not_found", "扫描目录不存在")
+        last_report = last_log = float("-inf")
+
+        def report(stage, current, total, *, force=False):
+            nonlocal last_report, last_log
+            now = time.monotonic()
+            text = f"{stage} · 已检查 {current} 个条目"
+            if total > 0:
+                text = f"{stage} · 已处理 {current}/{total} 个条目"
+            if force or now - last_log >= 10:
+                logger.info("本地导入扫描进度 %s", text)
+                last_log = now
+            if progress_callback is not None and (force or now - last_report >= 2):
+                progress_callback({"current": current, "total": total, "text": text})
+                last_report = now
+
+        report("枚举本地目录", 0, 0, force=True)
         try:
-            candidates = [source_path] if source_path.is_file() else list(source_path.rglob("*"))
+            candidates = []
+            entries = (source_path,) if source_path.is_file() else source_path.rglob("*")
+            for candidate in entries:
+                candidates.append(candidate)
+                report("枚举本地目录", len(candidates), 0)
         except OSError as exc:
             raise _provider_error(
                 "scan_import_source", "unavailable", "本地目录扫描失败", retryable=True
             ) from exc
+        total = len(candidates)
+        report("本地目录枚举完成", total, total, force=True)
+        report("检查本地文件", 0, total, force=True)
         result: list[ImportFile] = []
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
+            report("检查本地文件", index, total)
             try:
                 if candidate.is_symlink() or not candidate.is_file():
                     continue
@@ -585,6 +630,7 @@ class LocalStorageProvider:
                 )
             )
         result.sort(key=lambda item: (item.relative_path.casefold(), item.relative_path))
+        report(f"本地扫描完成 · 发现 {len(result)} 个文件", total, total, force=True)
         return tuple(result)
 
     def get_import_source_identity(self, *, source: ImportFile) -> str:
@@ -986,7 +1032,7 @@ class LocalStorageProvider:
                         receipt={"operation_key": operation_name, "token": existing["token"]},
                         size_bytes=existing["target_size"],
                         duration_seconds=duration_seconds,
-                        video_info=None,
+                        video_info=metadata.video_info,
                         resolution=resolution,
                     )
             if target.exists() or target.is_symlink():
@@ -1071,7 +1117,7 @@ class LocalStorageProvider:
             receipt=receipt,
             size_bytes=journal["target_size"],
             duration_seconds=duration_seconds,
-            video_info=None,
+            video_info=metadata.video_info,
             resolution=resolution,
         )
 
@@ -1251,6 +1297,11 @@ class LocalStorageProvider:
         return self._probe_file_duration_seconds(
             self._media_path(media, operation="probe_duration_seconds")
         )
+
+    def probe_video_info(self, *, media: MediaHandle) -> JsonObject | None:
+        return MediaMetadataProbeService.probe_file(
+            self._media_path(media, operation="probe_video_info")
+        ).video_info
 
     def probe_resolution(self, *, media: MediaHandle) -> str | None:
         return self._probe_file_resolution(
@@ -1466,7 +1517,12 @@ class LocalStorageProvider:
         layout = await asyncio.to_thread(self._build_merged_layout, medias=medias)
         return merged_range_requests_response(context.request, layout, "video/mp4")
 
-    def generate_thumbnails(self, *, media: MediaHandle, workspace: Path) -> ThumbnailGeneration:
+    def generate_thumbnails(
+        self, *, media: MediaHandle, workspace: Path,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> ThumbnailGeneration:
+        if progress_callback:
+            progress_callback("正在打开本地视频")
         source = self._media_path(media, operation="generate_thumbnails")
         workspace = self._workspace_path(workspace, operation="generate_thumbnails")
         try:
@@ -1535,6 +1591,9 @@ class LocalStorageProvider:
                 if duration_seconds <= 0:
                     return ThumbnailGeneration(expected_count=0, artifacts=())
 
+                expected_count = duration_seconds // interval_seconds + 1
+                if progress_callback:
+                    progress_callback(f"正在生成缩略图 · 已生成 0/{expected_count} 张")
                 for offset in range(0, duration_seconds + 1, interval_seconds):
                     try:
                         if offset == 0:
@@ -1564,6 +1623,10 @@ class LocalStorageProvider:
                             media.media_id,
                             offset,
                             exc,
+                        )
+                    if progress_callback:
+                        progress_callback(
+                            f"正在生成缩略图 · 已生成 {len(artifacts)}/{expected_count} 张"
                         )
         except ProviderOperationError:
             raise

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import threading
 from dataclasses import dataclass
@@ -90,6 +91,60 @@ def test_browse_scan_refs_are_relative_and_symlinks_are_ignored(tmp_path: Path) 
         "kind": "manual_local_path",
         "relative_path": "nested/clip.mp4",
     }
+
+
+def test_space_usage_reports_disk_capacity(tmp_path: Path) -> None:
+    provider, _library, _media_root, _import_root = _provider(tmp_path)
+
+    usage = provider.get_space_usage()
+
+    assert usage.total_bytes is not None and usage.total_bytes > 0
+    assert usage.used_bytes is not None and usage.used_bytes >= 0
+    assert usage.free_bytes is not None and usage.free_bytes >= 0
+    assert usage.total_bytes >= usage.used_bytes
+
+
+def test_space_usage_reports_unavailable_when_root_is_missing(tmp_path: Path) -> None:
+    provider, _library, media_root, _import_root = _provider(tmp_path)
+    shutil.rmtree(media_root)
+
+    with pytest.raises(ProviderOperationError) as error:
+        provider.get_space_usage()
+
+    assert error.value.operation == "get_space_usage"
+    assert error.value.code == "unavailable"
+
+
+@pytest.mark.parametrize("source_kind", ["empty", "directory", "file"])
+def test_scan_reports_stage_progress(tmp_path: Path, monkeypatch, caplog, source_kind: str) -> None:
+    provider, _library, _media_root, import_root = _provider(tmp_path)
+    relative_path = ""
+    expected_files = []
+    total = 0
+    if source_kind != "empty":
+        (import_root / "nested").mkdir()
+        (import_root / "nested" / "clip.mp4").write_bytes(b"video")
+        expected_files = ["nested/clip.mp4"]
+        total = 2
+        if source_kind == "file":
+            relative_path = "nested/clip.mp4"
+            total = 1
+    monkeypatch.setattr(storage_module.time, "monotonic", lambda: 0.0)
+    progress = []
+    with caplog.at_level("INFO"):
+        files = provider.scan_import_source(
+            source_ref={"version": 1, "kind": "manual_local_path", "relative_path": relative_path},
+            progress_callback=progress.append,
+        )
+    assert [item.relative_path for item in files] == expected_files
+    # Fast scans still emit stage boundaries, without per-entry updates.
+    assert [(item["current"], item["total"]) for item in progress] == [
+        (0, 0), (total, total), (0, total), (total, total),
+    ]
+    assert progress[0]["text"].startswith("枚举本地目录")
+    assert progress[2]["text"].startswith("检查本地文件")
+    assert f"发现 {len(expected_files)} 个文件" in progress[-1]["text"]
+    assert "本地扫描完成" in caplog.text
 
 
 def test_scan_managed_media_ref_keys_lists_regular_files_and_ignores_symlinks(
@@ -266,7 +321,7 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     monkeypatch.setattr(
         storage_module.MediaMetadataProbeService,
         "probe_file",
-        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280"),
+        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280", video_info={"video": {"codec_name": "h264"}}),
     )
     provider, library, media_root, import_root = _provider(tmp_path)
     source_path = import_root / "ABC-001.mp4"
@@ -294,6 +349,7 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     assert second.duration_seconds == 42
     assert first.resolution == "720x1280"
     assert second.resolution == "720x1280"
+    assert first.video_info == second.video_info == {"video": {"codec_name": "h264"}}
     target = media_root / "jav/ABC-001/import-1/ABC-001.mp4"
     assert target.read_bytes() == b"source"
     assert os.stat(target).st_ino == os.stat(source_path).st_ino
@@ -312,6 +368,9 @@ def test_stage_is_idempotent_and_layout_has_operation_version(
     assert provider.probe_resolution(
         media=_media(library, first.storage_ref["relative_path"])
     ) == "720x1280"
+    assert provider.probe_video_info(
+        media=_media(library, first.storage_ref["relative_path"])
+    ) == first.video_info
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
     assert not target.exists()
     provider.delete_media(media=_media(library, first.storage_ref["relative_path"]))
@@ -330,7 +389,7 @@ def test_stage_supports_legacy_staged_media_contract(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         storage_module.MediaMetadataProbeService,
         "probe_file",
-        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280"),
+        lambda _path: SimpleNamespace(duration_seconds=42, resolution="720x1280", video_info={"video": {"codec_name": "h264"}}),
     )
     provider, _library, _media_root, import_root = _provider(tmp_path)
     (import_root / "clip.mp4").write_bytes(b"source")
@@ -687,9 +746,15 @@ def test_thumbnails_seek_each_offset_and_write_webp(
     monkeypatch.setitem(sys.modules, "av", fake_av)
     monkeypatch.setattr(storage_module.os, "nice", lambda _value: 0)
     workspace = tmp_path / "thumbs"
+    progress = []
     generation = provider.generate_thumbnails(
-        media=_media(library, "videos/clip.mp4", duration=20), workspace=workspace
+        media=_media(library, "videos/clip.mp4", duration=20), workspace=workspace,
+        progress_callback=progress.append,
     )
+    assert progress[0] == "正在打开本地视频"
+    assert [text for text in progress if "已生成" in text] == [
+        f"正在生成缩略图 · 已生成 {count}/3 张" for count in range(4)
+    ]
     assert generation.expected_count == 3
     assert [artifact.offset_seconds for artifact in generation.artifacts] == [0, 10, 20]
     assert container.seek_calls == [10, 20]
